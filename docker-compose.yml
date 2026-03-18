@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    environment:
+      JWT_SECRET: "change-me-in-prod"
+      JWT_ALG: "HS256"
+      JWT_EXPIRES_MIN: "60"
+      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      PYTHONPATH: /app
+    volumes:
+      - ./backend:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+volumes:
+  pgdata:

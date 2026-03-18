@@ -1,0 +1,34 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+*.env
+
+# Local uploads / runtime
+backend/static/uploads/
+
+# Logs / cache
+*.log
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Local db artifacts
+*.sqlite3
