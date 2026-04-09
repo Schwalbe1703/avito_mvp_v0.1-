@@ -1,5 +1,7 @@
 import uuid
+import os
 
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -29,10 +31,30 @@ from app.clients_router import router as clients_router
 from app.admin_reviews_router import router as admin_reviews_router
 from app.admin_subscriptions_router import router as admin_subscriptions_router
 
+def get_cors_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://213.171.8.63",
+    ]
 
 app = FastAPI(docs_url="/docs", redoc_url=None)
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class RegisterIn(BaseModel):
     role: str  # client/master/admin
