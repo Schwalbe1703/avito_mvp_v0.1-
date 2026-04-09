@@ -41,7 +41,9 @@ def get_cors_origins() -> list[str]:
         "http://127.0.0.1:3000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://213.171.8.63",
+        "http://217.149.30.175",
+        "http://217.149.30.175:3000",
+        "http://217.149.30.175:5173",
     ]
 
 app = FastAPI(docs_url="/docs", redoc_url=None)
