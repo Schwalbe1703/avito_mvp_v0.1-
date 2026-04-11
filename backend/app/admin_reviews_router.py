@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 
@@ -18,7 +21,23 @@ from app.reviews_common import recompute_ad_rating
 router = APIRouter(prefix="/admin/reviews", tags=["admin-reviews"])
 
 
-def get_review_or_404(db: Session, review_id: str) -> Review:
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    )
+
+
+def get_review_or_404(db: Session, review_id: UUID) -> Review:
     review = (
         db.query(Review)
         .options(
@@ -29,15 +48,15 @@ def get_review_or_404(db: Session, review_id: str) -> Review:
         .first()
     )
     if not review:
-        raise HTTPException(status_code=404, detail="Review not found")
+        raise api_error(404, "review_not_found", "Отзыв не найден")
     return review
 
 
 @router.get("", response_model=list[AdminReviewListItemOut])
 def admin_reviews_list(
-    ad_id: str | None = Query(default=None),
-    master_id: str | None = Query(default=None),
-    author_id: str | None = Query(default=None),
+    ad_id: UUID | None = Query(default=None),
+    master_id: UUID | None = Query(default=None),
+    author_id: UUID | None = Query(default=None),
     is_published: bool | None = Query(default=None),
     has_master_reply: bool | None = Query(default=None),
     has_admin_reply: bool | None = Query(default=None),
@@ -48,7 +67,7 @@ def admin_reviews_list(
 ):
     require_admin(user)
 
-    q = (
+    query = (
         db.query(Review)
         .options(
             joinedload(Review.ad),
@@ -57,29 +76,29 @@ def admin_reviews_list(
     )
 
     if ad_id:
-        q = q.filter(Review.ad_id == ad_id)
+        query = query.filter(Review.ad_id == ad_id)
 
     if master_id:
-        q = q.filter(Review.master_id == master_id)
+        query = query.filter(Review.master_id == master_id)
 
     if author_id:
-        q = q.filter(Review.author_id == author_id)
+        query = query.filter(Review.author_id == author_id)
 
     if is_published is not None:
-        q = q.filter(Review.is_published == is_published)
+        query = query.filter(Review.is_published == is_published)
 
     if has_master_reply is True:
-        q = q.filter(Review.messages.any(ReviewMessage.author_role == "master"))
+        query = query.filter(Review.messages.any(ReviewMessage.author_role == "master"))
     elif has_master_reply is False:
-        q = q.filter(~Review.messages.any(ReviewMessage.author_role == "master"))
+        query = query.filter(~Review.messages.any(ReviewMessage.author_role == "master"))
 
     if has_admin_reply is True:
-        q = q.filter(Review.messages.any(ReviewMessage.author_role == "admin"))
+        query = query.filter(Review.messages.any(ReviewMessage.author_role == "admin"))
     elif has_admin_reply is False:
-        q = q.filter(~Review.messages.any(ReviewMessage.author_role == "admin"))
+        query = query.filter(~Review.messages.any(ReviewMessage.author_role == "admin"))
 
     reviews = (
-        q.order_by(Review.created_at.desc(), Review.id.desc())
+        query.order_by(Review.created_at.desc(), Review.id.desc())
         .offset(offset)
         .limit(limit)
         .all()
@@ -112,7 +131,7 @@ def admin_reviews_list(
 
 @router.get("/{review_id}", response_model=AdminReviewDetailOut)
 def admin_review_detail(
-    review_id: str,
+    review_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -136,7 +155,7 @@ def admin_review_detail(
 
 @router.post("/{review_id}/hide", response_model=AdminReviewVisibilityOut)
 def hide_review(
-    review_id: str,
+    review_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -156,7 +175,7 @@ def hide_review(
 
 @router.post("/{review_id}/restore", response_model=AdminReviewVisibilityOut)
 def restore_review(
-    review_id: str,
+    review_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):

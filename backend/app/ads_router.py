@@ -4,6 +4,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -32,18 +34,32 @@ from app.deps import get_db
 
 router = APIRouter(prefix="/ads", tags=["ads"])
 
-# Photos behavior toggle
-PHOTOS_TRIGGER_MODERATION = False  # set True later if you want photo changes -> moderation
+PHOTOS_TRIGGER_MODERATION = False
 MAX_PHOTO_SIZE_MB = 8
 ALLOWED_PHOTO_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
-# Daily free boost rule: once per day by MSK date
 MSK = ZoneInfo("Europe/Moscow")
+
+
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    )
 
 
 def require_master(user):
     if getattr(user, "role", None) != "master":
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise api_error(403, "forbidden", "Доступ разрешён только мастеру")
     return user
 
 
@@ -60,7 +76,6 @@ def get_city_by_slug(db: Session, slug: str) -> City | None:
 
 
 def public_visible_query(q):
-    # approved + active + not archived + subscription active/grace
     return (
         q.join(
             Subscription,
@@ -70,14 +85,23 @@ def public_visible_query(q):
             Ad.status == "approved",
             Ad.is_active == True,  # noqa: E712
             Ad.archived_at.is_(None),
-            Subscription.grace_until >= func.now(),  # paid OR grace
+            Subscription.grace_until >= func.now(),
         )
+    )
+
+
+def ad_load_options():
+    return (
+        joinedload(Ad.city_rel),
+        joinedload(Ad.districts_rel),
+        joinedload(Ad.photos),
     )
 
 
 def normalize_ru_phone(raw: str | None) -> str | None:
     if raw is None:
         return None
+
     s = raw.strip()
     if not s:
         return None
@@ -117,7 +141,12 @@ def enrich_city_fields(ad: Ad) -> dict:
 def enrich_districts_fields(ad: Ad) -> dict:
     districts = []
     for d in getattr(ad, "districts_rel", []) or []:
-        districts.append({"slug": getattr(d, "slug", None), "title": getattr(d, "title", None)})
+        districts.append(
+            {
+                "slug": getattr(d, "slug", None),
+                "title": getattr(d, "title", None),
+            }
+        )
     return {"districts": districts}
 
 
@@ -125,11 +154,63 @@ def enrich_photos_fields(ad: Ad) -> dict:
     photos = []
     cover = None
     items = getattr(ad, "photos", []) or []
+
     for p in items:
         photos.append({"id": p.id, "url": p.url, "sort_order": p.sort_order})
+
     if items:
-        cover = items[0].url  # first photo is cover
+        cover = items[0].url
+
     return {"photos": photos, "cover_url": cover}
+
+
+def to_ad_out(ad: Ad) -> AdOut:
+    data = AdOut.model_validate(ad).model_dump()
+    data.update(enrich_city_fields(ad))
+    data.update(enrich_districts_fields(ad))
+    data.update(enrich_photos_fields(ad))
+    return AdOut(**data)
+
+
+def to_ad_detail(ad: Ad) -> AdDetail:
+    masked = None
+    if getattr(ad, "show_phone", False) and getattr(ad, "contact_phone", None):
+        masked = mask_ru_phone(ad.contact_phone)
+
+    data = AdDetail.model_validate(ad).model_dump()
+    data.update(enrich_city_fields(ad))
+    data.update(enrich_districts_fields(ad))
+    data.update(enrich_photos_fields(ad))
+    data["contact_phone_masked"] = masked
+    return AdDetail(**data)
+
+
+def to_ad_owner_detail(ad: Ad) -> AdOwnerDetail:
+    data = AdOwnerDetail.model_validate(ad).model_dump()
+    data.update(enrich_city_fields(ad))
+    data.update(enrich_districts_fields(ad))
+    data.update(enrich_photos_fields(ad))
+    data["contact_phone"] = getattr(ad, "contact_phone", None)
+    data["show_phone"] = bool(getattr(ad, "show_phone", False))
+    return AdOwnerDetail(**data)
+
+
+def get_owned_ad(db: Session, master_id, ad_id: UUID) -> Ad | None:
+    return (
+        db.query(Ad)
+        .options(*ad_load_options())
+        .filter(Ad.id == ad_id, Ad.master_id == master_id)
+        .first()
+    )
+
+
+def get_public_ad(db: Session, ad_id: UUID) -> Ad | None:
+    return (
+        public_visible_query(db.query(Ad))
+        .options(*ad_load_options())
+        .filter(Ad.id == ad_id)
+        .first()
+    )
 
 
 def validate_and_fetch_districts(
@@ -148,16 +229,27 @@ def validate_and_fetch_districts(
     )
     found = {d.slug for d in districts}
     missing = [s for s in slugs if s not in found]
+
     if missing:
-        raise HTTPException(status_code=400, detail={"unknown_district_slugs": missing})
+        raise api_error(
+            400,
+            "unknown_district_slugs",
+            "Переданы неизвестные районы",
+            {"unknown_district_slugs": missing},
+        )
+
     return districts
 
 
-# ===== Cabinet helpers =====
 def validate_status_filter(status: str) -> str:
     allowed = {"moderation", "approved", "blocked"}
     if status not in allowed:
-        raise HTTPException(status_code=422, detail=f"Invalid status. Allowed: {sorted(allowed)}")
+        raise api_error(
+            422,
+            "invalid_status_filter",
+            "Недопустимый статус фильтра",
+            {"allowed": sorted(allowed)},
+        )
     return status
 
 
@@ -240,9 +332,7 @@ def build_cabinet_actions(ad: Ad, subscription_visible_now: bool, now_utc: datet
     )
 
 
-# ===== Boost helpers =====
 def effective_at_expr():
-    # ordering key for "feed": boosted_at wins, otherwise created_at
     return func.coalesce(Ad.boosted_at, Ad.created_at)
 
 
@@ -252,13 +342,11 @@ def msk_date(dt: datetime) -> datetime.date:
     return dt.astimezone(MSK).date()
 
 
-# ===== Photos storage helpers (local now, S3 later) =====
-def build_storage_key(ad_id: str, photo_id: uuid.UUID, ext: str) -> str:
+def build_storage_key(ad_id: UUID, photo_id: UUID, ext: str) -> str:
     return f"ads/{ad_id}/{photo_id}{ext}"
 
 
 def local_uploads_root() -> Path:
-    # backend/static/uploads/ inside docker container
     return Path("/app/static/uploads")
 
 
@@ -267,6 +355,10 @@ def ensure_local_path(storage_key: str) -> Path:
     path = root / storage_key
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def storage_path(storage_key: str) -> Path:
+    return local_uploads_root() / storage_key
 
 
 def build_public_url(storage_key: str) -> str:
@@ -281,7 +373,6 @@ def guess_ext(content_type: str) -> str:
     return ".jpg"
 
 
-# ===== Ads =====
 @router.post("", response_model=AdOut)
 def create_ad(
     payload: AdCreate,
@@ -292,16 +383,16 @@ def create_ad(
 
     category = get_category_by_slug(db, payload.category_slug)
     if not category:
-        raise HTTPException(status_code=404, detail="Category not found")
+        raise api_error(404, "category_not_found", "Категория не найдена")
 
     city = get_city_by_slug(db, payload.city_slug)
     if not city:
-        raise HTTPException(status_code=404, detail="City not found")
+        raise api_error(404, "city_not_found", "Город не найден")
 
     raw_phone = getattr(payload, "contact_phone", None)
     phone = normalize_ru_phone(raw_phone)
     if raw_phone and phone is None:
-        raise HTTPException(status_code=422, detail="Invalid phone format")
+        raise api_error(422, "invalid_phone_format", "Неверный формат телефона")
 
     ad = Ad(
         master_id=user.id,
@@ -310,7 +401,7 @@ def create_ad(
         title=payload.title,
         description=payload.description,
         price_from=payload.price_from,
-        city=payload.city,  # legacy
+        city=payload.city,
         status="moderation",
         work_time_text=getattr(payload, "work_time_text", None),
         contact_phone=phone,
@@ -318,7 +409,11 @@ def create_ad(
         price_note=getattr(payload, "price_note", None),
     )
 
-    districts = validate_and_fetch_districts(db, city.id, getattr(payload, "district_slugs", []) or [])
+    districts = validate_and_fetch_districts(
+        db,
+        city.id,
+        getattr(payload, "district_slugs", []) or [],
+    )
     if districts:
         ad.districts_rel = districts
 
@@ -327,20 +422,20 @@ def create_ad(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="You already have an ad in this category")
+        raise api_error(
+            409,
+            "ad_already_exists_in_category",
+            "У вас уже есть объявление в этой категории",
+        )
 
     ad = (
         db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
+        .options(*ad_load_options())
         .filter(Ad.id == ad.id)
         .first()
     )
 
-    data = AdOut.model_validate(ad).model_dump()
-    data.update(enrich_city_fields(ad))
-    data.update(enrich_districts_fields(ad))
-    data.update(enrich_photos_fields(ad))
-    return AdOut(**data)
+    return to_ad_out(ad)
 
 
 @router.get("/my", response_model=list[AdOut])
@@ -355,46 +450,38 @@ def my_ads(
 ):
     user = require_master(user)
 
-    q = (
+    ads_query = (
         db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
+        .options(*ad_load_options())
         .filter(Ad.master_id == user.id)
     )
 
     if status is not None:
         validate_status_filter(status)
-        q = q.filter(Ad.status == status)
+        ads_query = ads_query.filter(Ad.status == status)
 
     if archived is True:
-        q = q.filter(Ad.archived_at.is_not(None))
+        ads_query = ads_query.filter(Ad.archived_at.is_not(None))
     elif archived is False:
-        q = q.filter(Ad.archived_at.is_(None))
+        ads_query = ads_query.filter(Ad.archived_at.is_(None))
 
     if category:
         cat = get_category_by_slug(db, category)
         if not cat:
             return []
-        q = q.filter(Ad.category_id == cat.id)
+        ads_query = ads_query.filter(Ad.category_id == cat.id)
 
     if city:
         c = get_city_by_slug(db, city)
         if not c:
             return []
-        q = q.filter(Ad.city_id == c.id)
+        ads_query = ads_query.filter(Ad.city_id == c.id)
 
     if is_active is not None:
-        q = q.filter(Ad.is_active == is_active)
+        ads_query = ads_query.filter(Ad.is_active == is_active)
 
-    ads = q.order_by(Ad.created_at.desc()).all()
-
-    result: list[AdOut] = []
-    for ad in ads:
-        data = AdOut.model_validate(ad).model_dump()
-        data.update(enrich_city_fields(ad))
-        data.update(enrich_districts_fields(ad))
-        data.update(enrich_photos_fields(ad))
-        result.append(AdOut(**data))
-    return result
+    ads = ads_query.order_by(Ad.created_at.desc()).all()
+    return [to_ad_out(ad) for ad in ads]
 
 
 @router.get("/my/stats", response_model=MyAdsStats)
@@ -457,9 +544,9 @@ def my_cabinet(
             )
         )
 
-    q = (
+    ads_query = (
         db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
+        .options(*ad_load_options())
         .filter(Ad.master_id == user.id)
     )
 
@@ -467,41 +554,41 @@ def my_cabinet(
 
     if status is not None:
         validate_status_filter(status)
-        q = q.filter(Ad.status == status)
+        ads_query = ads_query.filter(Ad.status == status)
 
     if archived is True:
-        q = q.filter(Ad.archived_at.is_not(None))
+        ads_query = ads_query.filter(Ad.archived_at.is_not(None))
     elif archived is False:
-        q = q.filter(Ad.archived_at.is_(None))
+        ads_query = ads_query.filter(Ad.archived_at.is_(None))
 
     if category:
         cat = get_category_by_slug(db, category)
         if not cat:
             empty_result = True
         else:
-            q = q.filter(Ad.category_id == cat.id)
+            ads_query = ads_query.filter(Ad.category_id == cat.id)
 
     if city:
         c = get_city_by_slug(db, city)
         if not c:
             empty_result = True
         else:
-            q = q.filter(Ad.city_id == c.id)
+            ads_query = ads_query.filter(Ad.city_id == c.id)
 
     if is_active is not None:
-        q = q.filter(Ad.is_active == is_active)
+        ads_query = ads_query.filter(Ad.is_active == is_active)
 
     if empty_result:
         total = 0
         ads = []
     else:
         ads = (
-            q.order_by(effective_at_expr().desc(), Ad.created_at.desc(), Ad.id.desc())
+            ads_query.order_by(effective_at_expr().desc(), Ad.created_at.desc(), Ad.id.desc())
             .offset(offset)
             .limit(limit)
             .all()
         )
-        total = q.count()
+        total = ads_query.count()
 
     ads_out: list[CabinetAdItemOut] = []
 
@@ -562,47 +649,31 @@ def my_cabinet(
 
 @router.get("/my/{ad_id}", response_model=AdOwnerDetail)
 def my_ad_detail(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
-    data = AdOwnerDetail.model_validate(ad).model_dump()
-    data.update(enrich_city_fields(ad))
-    data.update(enrich_districts_fields(ad))
-    data.update(enrich_photos_fields(ad))
-    data["contact_phone"] = getattr(ad, "contact_phone", None)
-    data["show_phone"] = bool(getattr(ad, "show_phone", False))
-    return AdOwnerDetail(**data)
+    return to_ad_owner_detail(ad)
 
 
 @router.patch("/{ad_id}", response_model=AdOut)
 def update_my_ad(
-    ad_id: str,
+    ad_id: UUID,
     payload: AdUpdate,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     if payload.title is not None:
         ad.title = payload.title
@@ -614,7 +685,7 @@ def update_my_ad(
     if getattr(payload, "city_slug", None) is not None:
         city = get_city_by_slug(db, payload.city_slug)
         if not city:
-            raise HTTPException(status_code=404, detail="City not found")
+            raise api_error(404, "city_not_found", "Город не найден")
         ad.city_id = city.id
 
     if getattr(payload, "district_slugs", None) is not None:
@@ -631,13 +702,15 @@ def update_my_ad(
         raw_phone = payload.contact_phone
         phone = normalize_ru_phone(raw_phone)
         if raw_phone and phone is None:
-            raise HTTPException(status_code=422, detail="Invalid phone format")
+            raise api_error(422, "invalid_phone_format", "Неверный формат телефона")
         ad.contact_phone = phone
 
     if getattr(payload, "show_phone", None) is not None:
         ad.show_phone = payload.show_phone
+
     if getattr(payload, "price_note", None) is not None:
         ad.price_note = payload.price_note
+
     if getattr(payload, "is_active", None) is not None:
         ad.is_active = payload.is_active
 
@@ -646,34 +719,25 @@ def update_my_ad(
 
     ad2 = (
         db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
+        .options(*ad_load_options())
         .filter(Ad.id == ad.id)
         .first()
     )
 
-    data = AdOut.model_validate(ad2).model_dump()
-    data.update(enrich_city_fields(ad2))
-    data.update(enrich_districts_fields(ad2))
-    data.update(enrich_photos_fields(ad2))
-    return AdOut(**data)
+    return to_ad_out(ad2)
 
 
 @router.post("/{ad_id}/archive", response_model=AdOut)
 def archive_my_ad(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     ad.archived_at = func.now()
     ad.is_active = False
@@ -681,80 +745,66 @@ def archive_my_ad(
     db.commit()
     db.refresh(ad)
 
-    data = AdOut.model_validate(ad).model_dump()
-    data.update(enrich_city_fields(ad))
-    data.update(enrich_districts_fields(ad))
-    data.update(enrich_photos_fields(ad))
-    return AdOut(**data)
+    return to_ad_out(ad)
 
 
 @router.post("/{ad_id}/unarchive", response_model=AdOut)
 def unarchive_my_ad(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     ad.archived_at = None
     ad.is_active = True
-    ad.status = "moderation"  # safe: back to moderation after restore
+    ad.status = "moderation"
 
     db.commit()
     db.refresh(ad)
 
-    data = AdOut.model_validate(ad).model_dump()
-    data.update(enrich_city_fields(ad))
-    data.update(enrich_districts_fields(ad))
-    data.update(enrich_photos_fields(ad))
-    return AdOut(**data)
+    return to_ad_out(ad)
 
 
-# ===== Daily free boost (MSK) =====
 @router.post("/{ad_id}/free_boost", response_model=AdOut)
 def free_boost_ad(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
     now_utc = datetime.now(timezone.utc)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
-    # makes sense only for public-ready ads
     if ad.status != "approved" or not ad.is_active or ad.archived_at is not None:
-        raise HTTPException(status_code=409, detail="Ad must be approved, active and not archived")
+        raise api_error(
+            409,
+            "ad_not_ready_for_boost",
+            "Объявление должно быть одобрено, активно и не в архиве",
+        )
 
-    # must have active/grace subscription
     sub = (
         db.query(Subscription)
         .filter(Subscription.master_id == ad.master_id, Subscription.category_id == ad.category_id)
         .first()
     )
     if not sub or sub.grace_until < now_utc:
-        raise HTTPException(status_code=403, detail="Subscription is not active")
+        raise api_error(403, "subscription_inactive", "Подписка неактивна")
 
-    # once per MSK day
-    if ad.last_free_boost_at is not None:
-        if msk_date(ad.last_free_boost_at) == msk_date(now_utc):
-            raise HTTPException(status_code=409, detail="Free boost already used today (MSK)")
+    if ad.last_free_boost_at is not None and msk_date(ad.last_free_boost_at) == msk_date(now_utc):
+        raise api_error(
+            409,
+            "free_boost_already_used_today",
+            "Бесплатный буст уже использован сегодня",
+            {"timezone": "Europe/Moscow"},
+        )
 
     ad.boosted_at = now_utc
     ad.last_free_boost_at = now_utc
@@ -762,39 +812,43 @@ def free_boost_ad(
     db.commit()
     db.refresh(ad)
 
-    data = AdOut.model_validate(ad).model_dump()
-    data.update(enrich_city_fields(ad))
-    data.update(enrich_districts_fields(ad))
-    data.update(enrich_photos_fields(ad))
-    return AdOut(**data)
+    return to_ad_out(ad)
 
 
-# ===== Photos endpoints (no moderation by default, controlled by flag) =====
 @router.post("/{ad_id}/photos", response_model=AdOut)
 def upload_ad_photo(
-    ad_id: str,
+    ad_id: UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     if file.content_type not in ALLOWED_PHOTO_TYPES:
-        raise HTTPException(status_code=415, detail=f"Unsupported file type: {file.content_type}")
+        raise api_error(
+            415,
+            "unsupported_photo_type",
+            "Неподдерживаемый тип файла",
+            {
+                "content_type": file.content_type,
+                "allowed_types": sorted(ALLOWED_PHOTO_TYPES),
+            },
+        )
 
     content = file.file.read()
     max_bytes = MAX_PHOTO_SIZE_MB * 1024 * 1024
+
     if len(content) > max_bytes:
-        raise HTTPException(status_code=413, detail=f"File too large (max {MAX_PHOTO_SIZE_MB}MB)")
+        raise api_error(
+            413,
+            "photo_too_large",
+            f"Файл слишком большой, максимум {MAX_PHOTO_SIZE_MB} МБ",
+            {"max_size_mb": MAX_PHOTO_SIZE_MB},
+        )
 
     ext = guess_ext(file.content_type)
     photo_id = uuid.uuid4()
@@ -807,14 +861,14 @@ def upload_ad_photo(
     current_max = max([p.sort_order for p in (ad.photos or [])] or [0])
     new_sort = current_max + 1
 
-    p = AdPhoto(
+    photo = AdPhoto(
         id=photo_id,
         ad_id=ad.id,
         storage_key=storage_key,
         url=build_public_url(storage_key),
         sort_order=new_sort,
     )
-    db.add(p)
+    db.add(photo)
 
     if PHOTOS_TRIGGER_MODERATION:
         ad.status = "moderation"
@@ -823,41 +877,32 @@ def upload_ad_photo(
 
     ad2 = (
         db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
+        .options(*ad_load_options())
         .filter(Ad.id == ad.id)
         .first()
     )
 
-    data = AdOut.model_validate(ad2).model_dump()
-    data.update(enrich_city_fields(ad2))
-    data.update(enrich_districts_fields(ad2))
-    data.update(enrich_photos_fields(ad2))
-    return AdOut(**data)
+    return to_ad_out(ad2)
 
 
 @router.delete("/{ad_id}/photos/{photo_id}", response_model=AdOut)
 def delete_ad_photo(
-    ad_id: str,
-    photo_id: str,
+    ad_id: UUID,
+    photo_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_master(user)
 
-    ad = (
-        db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id, Ad.master_id == user.id)
-        .first()
-    )
+    ad = get_owned_ad(db, user.id, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     photo = db.query(AdPhoto).filter(AdPhoto.id == photo_id, AdPhoto.ad_id == ad.id).first()
     if not photo:
-        raise HTTPException(status_code=404, detail="Photo not found")
+        raise api_error(404, "photo_not_found", "Фото не найдено")
 
-    path = ensure_local_path(photo.storage_key)
+    path = storage_path(photo.storage_key)
     if path.exists():
         path.unlink(missing_ok=True)
 
@@ -870,16 +915,12 @@ def delete_ad_photo(
 
     ad2 = (
         db.query(Ad)
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
+        .options(*ad_load_options())
         .filter(Ad.id == ad.id)
         .first()
     )
 
-    data = AdOut.model_validate(ad2).model_dump()
-    data.update(enrich_city_fields(ad2))
-    data.update(enrich_districts_fields(ad2))
-    data.update(enrich_photos_fields(ad2))
-    return AdOut(**data)
+    return to_ad_out(ad2)
 
 
 @router.get("", response_model=list[AdOut])
@@ -893,116 +934,90 @@ def public_ads(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    query = public_visible_query(db.query(Ad)).options(
-        joinedload(Ad.city_rel),
-        joinedload(Ad.districts_rel),
-        joinedload(Ad.photos),
-    )
+    ads_query = public_visible_query(db.query(Ad)).options(*ad_load_options())
 
     if category:
         cat = get_category_by_slug(db, category)
         if not cat:
             return []
-        query = query.filter(Ad.category_id == cat.id)
+        ads_query = ads_query.filter(Ad.category_id == cat.id)
 
     if district and not city:
-        raise HTTPException(status_code=422, detail="Query param 'district' requires 'city'")
+        raise api_error(
+            422,
+            "district_requires_city",
+            "Параметр district можно использовать только вместе с city",
+        )
 
     if city:
         c = get_city_by_slug(db, city)
         if not c:
             return []
-        query = query.filter(Ad.city_id == c.id)
+        ads_query = ads_query.filter(Ad.city_id == c.id)
 
         if district:
             slugs = [s.strip() for s in district.split(",") if s and s.strip()]
             slugs = list(dict.fromkeys(slugs))
             if slugs:
-                # no duplicates: EXISTS instead of JOIN
-                query = query.filter(Ad.districts_rel.any(District.slug.in_(slugs)))
+                ads_query = ads_query.filter(Ad.districts_rel.any(District.slug.in_(slugs)))
 
     if q:
         s = q.strip()
         if s:
             like = f"%{s}%"
-            query = query.filter((Ad.title.ilike(like)) | (Ad.description.ilike(like)))
+            ads_query = ads_query.filter((Ad.title.ilike(like)) | (Ad.description.ilike(like)))
 
     eff = effective_at_expr()
 
     if sort in (None, "", "feed"):
-        query = query.order_by(eff.desc(), Ad.created_at.desc(), Ad.id.desc())
+        ads_query = ads_query.order_by(eff.desc(), Ad.created_at.desc(), Ad.id.desc())
     elif sort == "new":
-        query = query.order_by(Ad.created_at.desc(), Ad.id.desc())
+        ads_query = ads_query.order_by(Ad.created_at.desc(), Ad.id.desc())
     elif sort == "price_asc":
-        query = query.order_by(Ad.price_from.asc().nulls_last(), eff.desc(), Ad.id.desc())
+        ads_query = ads_query.order_by(Ad.price_from.asc().nulls_last(), eff.desc(), Ad.id.desc())
     elif sort == "price_desc":
-        query = query.order_by(Ad.price_from.desc().nulls_last(), eff.desc(), Ad.id.desc())
+        ads_query = ads_query.order_by(Ad.price_from.desc().nulls_last(), eff.desc(), Ad.id.desc())
     elif sort == "rating":
-        query = query.order_by(Ad.rating_avg.desc(), Ad.rating_count.desc(), eff.desc(), Ad.id.desc())
+        ads_query = ads_query.order_by(Ad.rating_avg.desc(), Ad.rating_count.desc(), eff.desc(), Ad.id.desc())
     else:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid sort. Allowed: feed, new, price_asc, price_desc, rating",
+        raise api_error(
+            422,
+            "invalid_sort",
+            "Недопустимый параметр сортировки",
+            {"allowed": ["feed", "new", "price_asc", "price_desc", "rating"]},
         )
 
-    ads = query.offset(offset).limit(limit).all()
-
-    result: list[AdOut] = []
-    for ad in ads:
-        data = AdOut.model_validate(ad).model_dump()
-        data.update(enrich_city_fields(ad))
-        data.update(enrich_districts_fields(ad))
-        data.update(enrich_photos_fields(ad))
-        result.append(AdOut(**data))
-    return result
+    ads = ads_query.offset(offset).limit(limit).all()
+    return [to_ad_out(ad) for ad in ads]
 
 
 @router.get("/{ad_id}", response_model=AdDetail)
 def ad_detail(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
 ):
-    ad = (
-        public_visible_query(db.query(Ad))
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id)
-        .first()
-    )
+    ad = get_public_ad(db, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
-    masked = None
-    if getattr(ad, "show_phone", False) and getattr(ad, "contact_phone", None):
-        masked = mask_ru_phone(ad.contact_phone)
-
-    data = AdDetail.model_validate(ad).model_dump()
-    data.update(enrich_city_fields(ad))
-    data.update(enrich_districts_fields(ad))
-    data.update(enrich_photos_fields(ad))
-    data["contact_phone_masked"] = masked
-    return AdDetail(**data)
+    return to_ad_detail(ad)
 
 
 @router.post("/{ad_id}/reveal_phone", response_model=RevealPhoneResponse)
 def reveal_phone(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    ad = (
-        public_visible_query(db.query(Ad))
-        .options(joinedload(Ad.city_rel), joinedload(Ad.districts_rel), joinedload(Ad.photos))
-        .filter(Ad.id == ad_id)
-        .first()
-    )
+    ad = get_public_ad(db, ad_id)
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     if not getattr(ad, "show_phone", False):
-        raise HTTPException(status_code=403, detail="Phone is hidden")
+        raise api_error(403, "phone_hidden", "Телефон скрыт")
 
     phone = getattr(ad, "contact_phone", None)
     if not phone:
-        raise HTTPException(status_code=404, detail="Phone not set")
+        raise api_error(404, "phone_not_set", "Телефон не указан")
 
     return RevealPhoneResponse(phone=phone)

@@ -1,20 +1,44 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.deps import get_db
-from app.auth import get_current_user
 from app.ads_models import Ad, Category
 from app.ads_schemas import AdOut, CategoryOut
 from app.admin_common import require_admin
+from app.auth import get_current_user
+from app.deps import get_db
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    )
 
 
 class CategoryPriceIn(BaseModel):
     subscription_price: float = Field(..., ge=0)
+
+
+class BlockAdIn(BaseModel):
+    reason: str = Field(..., min_length=1)
 
 
 @router.get("/ads/moderation", response_model=list[AdOut])
@@ -33,7 +57,7 @@ def moderation_queue(
 
 @router.post("/ads/{ad_id}/approve", response_model=AdOut)
 def approve_ad(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -41,10 +65,9 @@ def approve_ad(
 
     ad = db.query(Ad).filter(Ad.id == ad_id).first()
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     ad.status = "approved"
-    # clear block meta if present
     if hasattr(ad, "blocked_reason"):
         ad.blocked_reason = None
     if hasattr(ad, "blocked_at"):
@@ -57,26 +80,27 @@ def approve_ad(
 
 @router.post("/ads/{ad_id}/block", response_model=AdOut)
 def block_ad(
-    ad_id: str,
-    payload: dict,
+    ad_id: UUID,
+    payload: BlockAdIn,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user = require_admin(user)
 
-    reason = payload.get("reason")
-    if not reason or not str(reason).strip():
-        raise HTTPException(status_code=422, detail="reason is required")
+    reason = payload.reason.strip()
+    if not reason:
+        raise api_error(422, "block_reason_required", "Нужно указать причину блокировки")
 
     ad = db.query(Ad).filter(Ad.id == ad_id).first()
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
 
     ad.status = "blocked"
     if hasattr(ad, "blocked_reason"):
-        ad.blocked_reason = str(reason).strip()
+        ad.blocked_reason = reason
     if hasattr(ad, "blocked_at"):
-        ad.blocked_at = None  # optional: set in DB via now if you want
+        ad.blocked_at = datetime.now(timezone.utc)
+
     db.commit()
     db.refresh(ad)
     return ad
@@ -91,11 +115,11 @@ def set_category_price(
 ):
     user = require_admin(user)
 
-    c = db.query(Category).filter(Category.slug == category_slug).first()
-    if not c:
-        raise HTTPException(status_code=404, detail="Category not found")
+    category = db.query(Category).filter(Category.slug == category_slug).first()
+    if not category:
+        raise api_error(404, "category_not_found", "Категория не найдена")
 
-    c.subscription_price = payload.subscription_price
+    category.subscription_price = payload.subscription_price
     db.commit()
-    db.refresh(c)
-    return c
+    db.refresh(category)
+    return category

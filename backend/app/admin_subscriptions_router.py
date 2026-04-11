@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal
+from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
@@ -17,13 +18,44 @@ from app.auth import get_current_user
 from app.deps import get_db
 from app.subscriptions_common import (
     extend_or_create_subscription,
-    get_category_by_slug,
     get_master_or_404,
     revoke_subscription_now,
     sub_status,
 )
 
 router = APIRouter(prefix="/admin/subscriptions", tags=["admin-subscriptions"])
+
+
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    )
+
+
+def get_master_or_api_error(db: Session, master_id: UUID):
+    try:
+        return get_master_or_404(db, str(master_id))
+    except HTTPException as exc:
+        if exc.status_code in {403, 404}:
+            raise api_error(404, "master_not_found", "Мастер не найден")
+        raise
+
+
+def get_category_or_404(db: Session, category_slug: str) -> Category:
+    category = db.query(Category).filter(Category.slug == category_slug).first()
+    if not category:
+        raise api_error(404, "category_not_found", "Категория не найдена")
+    return category
 
 
 def to_admin_subscription_out(sub: Subscription, now: datetime) -> AdminSubscriptionOut:
@@ -43,7 +75,7 @@ def to_admin_subscription_out(sub: Subscription, now: datetime) -> AdminSubscrip
 
 @router.get("", response_model=list[AdminSubscriptionOut])
 def admin_subscriptions_list(
-    master_id: str | None = Query(default=None),
+    master_id: UUID | None = Query(default=None),
     category_slug: str | None = Query(default=None),
     status: str | None = Query(default=None, description="active|grace|expired"),
     limit: int = Query(default=20, ge=1, le=100),
@@ -54,29 +86,31 @@ def admin_subscriptions_list(
     require_admin(user)
     now = datetime.now(timezone.utc)
 
-    q = (
-        db.query(Subscription)
-        .options(joinedload(Subscription.category))
-    )
+    query = db.query(Subscription).options(joinedload(Subscription.category))
 
     if master_id:
-        q = q.filter(Subscription.master_id == master_id)
+        query = query.filter(Subscription.master_id == master_id)
 
     if category_slug:
-        q = q.join(Subscription.category).filter(Category.slug == category_slug)
+        query = query.join(Subscription.category).filter(Category.slug == category_slug)
 
     if status is not None:
         if status == "active":
-            q = q.filter(Subscription.paid_until >= now)
+            query = query.filter(Subscription.paid_until >= now)
         elif status == "grace":
-            q = q.filter(Subscription.paid_until < now, Subscription.grace_until >= now)
+            query = query.filter(Subscription.paid_until < now, Subscription.grace_until >= now)
         elif status == "expired":
-            q = q.filter(Subscription.grace_until < now)
+            query = query.filter(Subscription.grace_until < now)
         else:
-            raise HTTPException(status_code=422, detail="Invalid status. Allowed: active, grace, expired")
+            raise api_error(
+                422,
+                "invalid_subscription_status_filter",
+                "Недопустимый статус фильтра",
+                {"allowed": ["active", "grace", "expired"]},
+            )
 
     subs = (
-        q.order_by(
+        query.order_by(
             Subscription.grace_until.desc(),
             Subscription.updated_at.desc(),
             Subscription.id.desc(),
@@ -98,11 +132,8 @@ def grant_subscription(
     require_admin(user)
     now = datetime.now(timezone.utc)
 
-    get_master_or_404(db, str(payload.master_id))
-
-    category = get_category_by_slug(db, payload.category_slug)
-    if not category:
-        raise HTTPException(status_code=404, detail="Category not found")
+    get_master_or_api_error(db, payload.master_id)
+    category = get_category_or_404(db, payload.category_slug)
 
     sub = extend_or_create_subscription(
         db,
@@ -134,11 +165,8 @@ def revoke_subscription(
     require_admin(user)
     now = datetime.now(timezone.utc)
 
-    get_master_or_404(db, str(payload.master_id))
-
-    category = get_category_by_slug(db, payload.category_slug)
-    if not category:
-        raise HTTPException(status_code=404, detail="Category not found")
+    get_master_or_api_error(db, payload.master_id)
+    category = get_category_or_404(db, payload.category_slug)
 
     sub = (
         db.query(Subscription)
@@ -150,7 +178,7 @@ def revoke_subscription(
         .first()
     )
     if not sub:
-        raise HTTPException(status_code=404, detail="Subscription not found")
+        raise api_error(404, "subscription_not_found", "Подписка не найдена")
 
     revoke_subscription_now(sub, now=now)
     db.commit()

@@ -2,8 +2,9 @@ import uuid
 import os
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -31,6 +32,7 @@ from app.clients_router import router as clients_router
 from app.admin_reviews_router import router as admin_reviews_router
 from app.admin_subscriptions_router import router as admin_subscriptions_router
 
+
 def get_cors_origins() -> list[str]:
     raw = os.getenv("CORS_ORIGINS", "").strip()
     if raw:
@@ -44,9 +46,99 @@ def get_cors_origins() -> list[str]:
         "http://217.149.30.175",
         "http://217.149.30.175:3000",
         "http://217.149.30.175:5173",
+        "https://masters-bez-posrednikov.vercel.app",
+        "https://masters-bez-posrednikov-31f9106m8-123zheshko-gmailcoms-projects.vercel.app",
     ]
 
+
 app = FastAPI(docs_url="/docs", redoc_url=None)
+
+
+def error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    details=None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "details": details,
+            }
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+
+    if isinstance(detail, dict):
+        code = detail.get("code", "http_error")
+        message = detail.get("message", "Ошибка запроса")
+        details = detail.get("details")
+        return error_response(
+            status_code=exc.status_code,
+            code=code,
+            message=message,
+            details=details,
+        )
+
+    default_code_map = {
+        400: "bad_request",
+        401: "unauthorized",
+        403: "forbidden",
+        404: "not_found",
+        405: "method_not_allowed",
+        409: "conflict",
+        422: "validation_error",
+    }
+
+    return error_response(
+        status_code=exc.status_code,
+        code=default_code_map.get(exc.status_code, "http_error"),
+        message=str(detail) if detail else "Ошибка запроса",
+        details=None,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    details = []
+
+    for err in exc.errors():
+        loc = err.get("loc", [])
+        field = ".".join(str(x) for x in loc if x != "body")
+
+        details.append(
+            {
+                "field": field or None,
+                "message": err.get("msg", "Invalid value"),
+                "type": err.get("type"),
+            }
+        )
+
+    return error_response(
+        status_code=422,
+        code="validation_error",
+        message="Ошибка валидации запроса",
+        details=details,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return error_response(
+        status_code=500,
+        code="internal_error",
+        message="Внутренняя ошибка сервера",
+        details=None,
+    )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,8 +150,9 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 class RegisterIn(BaseModel):
-    role: str  # client/master/admin
+    role: str  # client/master
     name: str
     email: str | None = None
     phone: str | None = None
@@ -92,15 +185,36 @@ def db_health(db: Session = Depends(get_db)):
 
 @app.post("/auth/register", response_model=UserOut)
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
-    if payload.role not in {"client", "master", "admin"}:
-        raise HTTPException(status_code=400, detail="role must be client/master/admin")
+    if payload.role not in {"client", "master"}:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_role",
+                "message": "Роль должна быть client или master",
+                "details": {"allowed_roles": ["client", "master"]},
+            },
+        )
 
     if not payload.email and not payload.phone:
-        raise HTTPException(status_code=400, detail="email or phone is required")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "email_or_phone_required",
+                "message": "Нужно указать email или phone",
+                "details": None,
+            },
+        )
 
     existing = get_user_by_email_or_phone(db, payload.email, payload.phone)
     if existing:
-        raise HTTPException(status_code=409, detail="user already exists")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "user_already_exists",
+                "message": "Пользователь уже существует",
+                "details": None,
+            },
+        )
 
     user = create_user(
         db,
@@ -131,7 +245,14 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 
     user = get_user_by_email_or_phone(db, email, phone)
     if not user or not verify_password(password, user.password_hash):
-        raise HTTPException(status_code=401, detail="invalid credentials")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "invalid_credentials",
+                "message": "Неверный логин или пароль",
+                "details": None,
+            },
+        )
 
     token = create_access_token(str(user.id))
     return TokenOut(access_token=token)

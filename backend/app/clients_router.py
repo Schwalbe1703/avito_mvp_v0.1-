@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -17,9 +20,25 @@ from app.deps import get_db
 router = APIRouter(prefix="/clients", tags=["clients"])
 
 
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    )
+
+
 def require_client(user):
     if getattr(user, "role", None) != "client":
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise api_error(403, "forbidden", "Доступ разрешён только клиенту")
     return user
 
 
@@ -39,16 +58,16 @@ def public_ad_query(db: Session):
     )
 
 
-def get_public_ad_or_404(db: Session, ad_id: str) -> Ad:
+def get_public_ad_or_404(db: Session, ad_id: UUID) -> Ad:
     ad = public_ad_query(db).filter(Ad.id == ad_id).first()
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
     return ad
 
 
 @router.post("/ads/{ad_id}/favorite", response_model=FavoriteToggleOut)
 def add_to_favorites(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -76,7 +95,7 @@ def add_to_favorites(
 
 @router.delete("/ads/{ad_id}/favorite", response_model=FavoriteToggleOut)
 def remove_from_favorites(
-    ad_id: str,
+    ad_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):

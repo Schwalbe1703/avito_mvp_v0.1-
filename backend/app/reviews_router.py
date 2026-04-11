@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -19,19 +22,34 @@ from app.auth import get_current_user
 from app.deps import get_db
 from app.reviews_common import recompute_ad_rating
 
-
 router = APIRouter(prefix="/ads", tags=["reviews"])
+
+
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    )
 
 
 def require_client(user):
     if getattr(user, "role", None) != "client":
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise api_error(403, "forbidden", "Доступ разрешён только клиенту")
     return user
 
 
 def require_master_or_admin(user):
     if getattr(user, "role", None) not in {"master", "admin"}:
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise api_error(403, "forbidden", "Доступ разрешён только мастеру или администратору")
     return user
 
 
@@ -51,14 +69,14 @@ def public_ad_query(db: Session):
     )
 
 
-def get_public_ad_or_404(db: Session, ad_id: str) -> Ad:
+def get_public_ad_or_404(db: Session, ad_id: UUID) -> Ad:
     ad = public_ad_query(db).filter(Ad.id == ad_id).first()
     if not ad:
-        raise HTTPException(status_code=404, detail="Ad not found")
+        raise api_error(404, "ad_not_found", "Объявление не найдено")
     return ad
 
 
-def get_public_review_or_404(db: Session, ad_id: str, review_id: str) -> Review:
+def get_public_review_or_404(db: Session, ad_id: UUID, review_id: UUID) -> Review:
     get_public_ad_or_404(db, ad_id)
 
     review = (
@@ -72,11 +90,11 @@ def get_public_review_or_404(db: Session, ad_id: str, review_id: str) -> Review:
         .first()
     )
     if not review:
-        raise HTTPException(status_code=404, detail="Review not found")
+        raise api_error(404, "review_not_found", "Отзыв не найден")
     return review
 
 
-def get_author_review_or_404(db: Session, ad_id: str, review_id: str, author_id) -> Review:
+def get_author_review_or_404(db: Session, ad_id: UUID, review_id: UUID, author_id) -> Review:
     review = (
         db.query(Review)
         .filter(
@@ -88,11 +106,11 @@ def get_author_review_or_404(db: Session, ad_id: str, review_id: str, author_id)
         .first()
     )
     if not review:
-        raise HTTPException(status_code=404, detail="Review not found")
+        raise api_error(404, "review_not_found", "Отзыв не найден")
     return review
 
 
-def get_review_for_reply_or_404(db: Session, ad_id: str, review_id: str, user) -> Review:
+def get_review_for_reply_or_404(db: Session, ad_id: UUID, review_id: UUID, user) -> Review:
     review = (
         db.query(Review)
         .join(Review.ad)
@@ -104,15 +122,20 @@ def get_review_for_reply_or_404(db: Session, ad_id: str, review_id: str, user) -
         .first()
     )
     if not review:
-        raise HTTPException(status_code=404, detail="Review not found")
+        raise api_error(404, "review_not_found", "Отзыв не найден")
 
     if user.role == "master" and review.ad.master_id != user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise api_error(403, "forbidden", "Недостаточно прав для ответа на этот отзыв")
 
     return review
 
 
-def get_own_review_message_or_404(db: Session, review_id: str, message_id: str, user) -> ReviewMessage:
+def get_own_review_message_or_404(
+    db: Session,
+    review_id: UUID,
+    message_id: UUID,
+    user,
+) -> ReviewMessage:
     message = (
         db.query(ReviewMessage)
         .filter(
@@ -124,7 +147,7 @@ def get_own_review_message_or_404(db: Session, review_id: str, message_id: str, 
         .first()
     )
     if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
+        raise api_error(404, "review_message_not_found", "Сообщение не найдено")
     return message
 
 
@@ -138,13 +161,13 @@ def normalize_review_text(text: str | None) -> str | None:
 def normalize_message_text(text: str) -> str:
     text = text.strip()
     if not text:
-        raise HTTPException(status_code=422, detail="Text cannot be empty")
+        raise api_error(422, "empty_message_text", "Текст не может быть пустым")
     return text
 
 
 @router.get("/{ad_id}/reviews", response_model=list[ReviewOut])
 def list_reviews(
-    ad_id: str,
+    ad_id: UUID,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -167,8 +190,8 @@ def list_reviews(
 
 @router.get("/{ad_id}/reviews/{review_id}/thread", response_model=ReviewThreadOut)
 def get_review_thread(
-    ad_id: str,
-    review_id: str,
+    ad_id: UUID,
+    review_id: UUID,
     db: Session = Depends(get_db),
 ):
     review = get_public_review_or_404(db, ad_id, review_id)
@@ -180,7 +203,7 @@ def get_review_thread(
 
 @router.post("/{ad_id}/reviews", response_model=ReviewOut, status_code=status.HTTP_201_CREATED)
 def create_review(
-    ad_id: str,
+    ad_id: UUID,
     payload: ReviewCreate,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -189,7 +212,7 @@ def create_review(
     ad = get_public_ad_or_404(db, ad_id)
 
     if ad.master_id == user.id:
-        raise HTTPException(status_code=409, detail="You cannot review your own ad")
+        raise api_error(409, "cannot_review_own_ad", "Нельзя оставить отзыв на собственное объявление")
 
     review = Review(
         ad_id=ad.id,
@@ -205,7 +228,7 @@ def create_review(
         db.flush()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="You already left a review for this ad")
+        raise api_error(409, "review_already_exists", "Вы уже оставили отзыв на это объявление")
 
     recompute_ad_rating(db, ad.id)
     db.commit()
@@ -216,8 +239,8 @@ def create_review(
 
 @router.patch("/{ad_id}/reviews/{review_id}", response_model=ReviewOut)
 def update_review(
-    ad_id: str,
-    review_id: str,
+    ad_id: UUID,
+    review_id: UUID,
     payload: ReviewUpdate,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -228,7 +251,7 @@ def update_review(
 
     patch = payload.model_dump(exclude_unset=True)
     if not patch:
-        raise HTTPException(status_code=422, detail="No fields to update")
+        raise api_error(422, "empty_review_update", "Нет полей для обновления")
 
     if "rating" in patch:
         review.rating = patch["rating"]
@@ -246,8 +269,8 @@ def update_review(
 
 @router.delete("/{ad_id}/reviews/{review_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_review(
-    ad_id: str,
-    review_id: str,
+    ad_id: UUID,
+    review_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -270,8 +293,8 @@ def delete_review(
     status_code=status.HTTP_201_CREATED,
 )
 def create_review_message(
-    ad_id: str,
-    review_id: str,
+    ad_id: UUID,
+    review_id: UUID,
     payload: ReviewMessageCreate,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -297,9 +320,9 @@ def create_review_message(
     response_model=ReviewMessageOut,
 )
 def update_review_message(
-    ad_id: str,
-    review_id: str,
-    message_id: str,
+    ad_id: UUID,
+    review_id: UUID,
+    message_id: UUID,
     payload: ReviewMessageUpdate,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -311,7 +334,7 @@ def update_review_message(
 
     patch = payload.model_dump(exclude_unset=True)
     if not patch:
-        raise HTTPException(status_code=422, detail="No fields to update")
+        raise api_error(422, "empty_review_message_update", "Нет полей для обновления")
 
     if "text" in patch:
         message.text = normalize_message_text(patch["text"])
@@ -327,9 +350,9 @@ def update_review_message(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 def delete_review_message(
-    ad_id: str,
-    review_id: str,
-    message_id: str,
+    ad_id: UUID,
+    review_id: UUID,
+    message_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
